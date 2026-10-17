@@ -4,7 +4,7 @@
   job.py kaggle submit  <jobdir>            resolve pinned SHA, inject, push kernel
   job.py kaggle status  [slug]              poll kernel status (one shot)
   job.py kaggle wait    <minutes> [slug]    poll until a NEW run terminates (0 ok/1 err/2 timeout)
-  job.py kaggle fetch   <jobdir>             download kernel output -> jobdir/result/raw/
+  job.py kaggle fetch   <jobdir>             download kernel output -> jobdir/result/raw/ (0 ok / non-zero = nothing promoted)
   job.py actions dispatch <workflow> <sha> <jobname> <shards> <maxparallel>
   job.py actions watch   [run_id]             poll latest heavy run (one shot)
   job.py actions fetch   <run_id> <jobdir>    download artifacts -> jobdir/result/ runs
@@ -16,8 +16,11 @@ Kaggle kernel slug: from worker/kernel-metadata.json (id field).
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -157,26 +160,73 @@ def kaggle_wait(minutes, slug=None):
 
 
 def kaggle_fetch(jobdir, slug=None):
+    """Download kernel output; promote only this invocation's summary.
+
+    The download is staged inside the cache directory and the summary is
+    selected from that staging directory alone: a successful transfer can
+    omit paths left by an older run, so selecting from the persistent
+    cache would promote stale output (lexical order is not age — zzz-old
+    sorts last). The candidate list is final, not a starting point; a
+    caller that falls back to searching the cache reinstates the stale
+    promotion. The cache keeps every prior download (a fresh file
+    supersedes the same-named file from an earlier run), and a failed run
+    retains its partial output without promoting anything; a file whose
+    cache copy fails is likewise left out of the candidates. Symlinked
+    files are dereferenced into the cache; symlinked directories are not
+    descended. Staging beside the cache avoids a cross-device copy and a
+    system tmp that may be too small for the kernel output.
+    Returns the download exit status (0 on success, non-zero when nothing
+    was promoted).
+    """
     slug = slug or kaggle_slug()
     raw = os.path.join(jobdir, "result", "raw")
     os.makedirs(raw, exist_ok=True)
-    rc, out = sh("{} kernels output {} -p {}".format(KAGGLE_CLI, slug, raw), timeout=180)
-    print(out)
-    # find summary.json anywhere under raw
-    found = []
-    for root, _, files in os.walk(raw):
-        for fn in files:
-            if fn == "summary.json":
-                found.append(os.path.join(root, fn))
-    if found:
-        import shutil
-        dst = os.path.join(jobdir, "result", "summary.json")
-        shutil.copyfile(sorted(found)[-1], dst)
-        print("summary.json -> " + dst)
-        with open(dst) as f:
-            print(json.dumps(json.load(f), indent=2)[:3000])
-    else:
-        print("WARNING: no summary.json in output")
+    try:
+        staging = tempfile.mkdtemp(prefix=".staging-", dir=raw)
+    except OSError as e:
+        print("WARNING: cannot stage download under {}: {}".format(raw, e))
+        return 1
+    try:
+        rc, out = sh("{} kernels output {} -p {}".format(
+            KAGGLE_CLI, shlex.quote(slug), shlex.quote(staging)), timeout=180)
+        print(out)
+        # Retain the downloaded artifacts in the cache regardless of the
+        # exit status, then promote only on success.
+        found = []
+        for root, _, files in os.walk(staging):
+            rel = os.path.relpath(root, staging)
+            cache_dir = os.path.join(raw, rel)
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+            except OSError as e:
+                # A cached name that changed from file to directory (or a
+                # full disk) must not abort the fetch with a traceback.
+                print("WARNING: could not create cache dir {}: {}".format(rel, e))
+                continue
+            for fn in files:
+                src = os.path.join(root, fn)
+                try:
+                    shutil.copy2(src, os.path.join(cache_dir, fn))
+                except OSError as e:
+                    print("WARNING: could not cache {}: {}".format(fn, e))
+                    continue
+                if fn == "summary.json":
+                    found.append(src)
+        if rc != 0:
+            print("WARNING: kaggle kernels output failed (exit {}); "
+                  "no summary promoted".format(rc))
+            return rc
+        if found:
+            dst = os.path.join(jobdir, "result", "summary.json")
+            shutil.copyfile(sorted(found)[-1], dst)
+            print("summary.json -> " + dst)
+            with open(dst) as f:
+                print(json.dumps(json.load(f), indent=2)[:3000])
+        else:
+            print("WARNING: no summary.json in output")
+        return 0
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # --------------------------------------------------------------- actions tier
@@ -224,7 +274,7 @@ def main():
         minutes = float(sys.argv[3])
         sys.exit(kaggle_wait(minutes, sys.argv[4] if len(sys.argv) > 4 else None))
     elif tier == "kaggle" and action == "fetch" and len(sys.argv) == 4:
-        kaggle_fetch(os.path.abspath(sys.argv[3]))
+        sys.exit(kaggle_fetch(os.path.abspath(sys.argv[3])) or 0)
     elif tier == "actions" and action == "dispatch" and len(sys.argv) == 8:
         try:
             shards, maxparallel = int(sys.argv[6]), int(sys.argv[7])
