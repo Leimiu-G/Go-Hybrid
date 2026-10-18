@@ -62,7 +62,7 @@ jobs:
           mkdir -p /tmp/selftest && cd /tmp/selftest
           cat > job.json <<'EOF'
           {
-            "job": "ci-selftest", "tier": "actions", "sha": "none", "repo": "none", "gpu": false,
+            "job": "ci-selftest", "tier": "actions", "sha": "HEAD", "repo": "none", "gpu": false,
             "setup": [],
             "commands": [
               {"name": "echo", "run": "echo ci-selftest-ok", "timeout": 30},
