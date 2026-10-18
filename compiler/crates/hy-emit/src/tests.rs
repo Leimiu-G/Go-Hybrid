@@ -989,6 +989,65 @@ fn assign_slot_loan_copies_and_stores_back() {
 }
 
 #[test]
+fn paren_receiver_keeps_atomic_method_mapping() {
+    // A postfix receiver never needs parentheses, so `(hits).add(1)` must emit
+    // exactly what `hits.add(1)` emits. It used to keep the parens AND lose
+    // the type (the resolution paths match on the receiver's shape, and
+    // `Paren` matched nothing), so `add` / `load` stayed in snake_case and
+    // `go build` rejected `(hits).add ... has no field or method add, but does
+    // have method Add`. Corpus 17, one paren pair.
+    let go = emit(
+        "import \"sync/atomic\"\n\nfn probe(hits *atomic.int64) {\n    (hits).add(1)\n    fmt.println(\"hits: {hits.load()}\")\n}\n",
+    );
+    assert!(go.contains("hits.Add(1)"), "method must be normalized:\n{}", go);
+    assert!(go.contains("hits.Load()"), "method must be normalized:\n{}", go);
+    assert!(
+        !go.contains("(hits)"),
+        "a postfix receiver never needs the parens:\n{}",
+        go
+    );
+}
+
+#[test]
+fn paren_receiver_keeps_struct_field_method_mapping() {
+    // Same hole through the user-struct route: `stats.mu` only resolves to
+    // `sync.mutex` via var_struct + struct_fields, and that lookup keyed on an
+    // `Expr::Ident` root — so `(stats).mu` silently lost the type and emitted
+    // `mu.lock()`. Corpus 18, one paren pair.
+    let go = emit(
+        "import \"sync\"\n\nstruct pool_stats {\n    mu sync.mutex\n    hits int\n}\n\nfn bump(stats *pool_stats) {\n    (stats).mu.lock()\n    stats.hits++\n    (stats).mu.unlock()\n}\n",
+    );
+    assert!(go.contains("stats.mu.Lock()"), "lock must be normalized:\n{}", go);
+    assert!(
+        go.contains("stats.mu.Unlock()"),
+        "unlock must be normalized:\n{}",
+        go
+    );
+    assert!(
+        !go.contains("(stats)"),
+        "a postfix receiver never needs the parens:\n{}",
+        go
+    );
+}
+
+#[test]
+fn paren_receiver_drops_the_parens_on_a_foreign_handle() {
+    // The foreign-member route (`handle` → `Handle`) keys on the receiver
+    // being an `Expr::Ident`; a `Paren` fell through to the verbatim spelling
+    // and emitted a Go method that does not exist. Corpus 10, one paren pair.
+    let go = emit(
+        "import \"net/http\"\n\nfn serve(mux *http.serve_mux) {\n    (mux).handle(\"/ping\", http.handler(fn(w http.response_writer, r *http.request) {\n        fmt.fprintln(w, \"pong\")\n    }))\n}\n",
+    );
+    assert!(go.contains("mux.Handle("), "member must be normalized:\n{}", go);
+    assert!(!go.contains(".handle("), "no unexported Go method:\n{}", go);
+    assert!(
+        !go.contains("(mux)"),
+        "a postfix receiver never needs the parens:\n{}",
+        go
+    );
+}
+
+#[test]
 fn single_var_iterate_value_semantics() {
     // Slices: `for w in shard` binds the VALUE (Go's range binds the index).
     let go = emit("fn f(shard []int) {\n    for w in shard {\n        _ = w\n    }\n}\n");

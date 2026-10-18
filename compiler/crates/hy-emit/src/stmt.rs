@@ -425,7 +425,7 @@ impl Emitter {
         e as *const Expr as usize
     }
 
-    fn peel_parens(mut e: &Expr) -> &Expr {
+    pub(crate) fn peel_parens(mut e: &Expr) -> &Expr {
         while let Expr::Paren { inner, .. } = e {
             e = inner;
         }
@@ -1297,6 +1297,12 @@ impl Emitter {
     /// Member-name normalization decision for a field/method access whose
     /// base's ROOT binding is `base` (an Ident chain root).
     pub fn member_name(&self, base: &Expr, name: &str) -> String {
+        // The decision is made from the binding behind the receiver's ROOT, so
+        // a `Paren` wrapper must not hide it: `(mux).handle` is `mux.handle`
+        // and the foreign-member normalisation applies to both. (The emitter
+        // now emits the peeled receiver as well, so this is belt and braces —
+        // any future caller that passes a parenthesized base still resolves.)
+        let base = Self::peel_parens(base);
         if let Expr::Ident { name: root, .. } = base {
             if self.is_unshadowed_pkg_root(root) {
                 return to_go_name(name);

@@ -186,9 +186,17 @@ impl Emitter {
             }
 
             Expr::Field { base, name, .. } => {
+                // A postfix receiver never needs parentheses, and every
+                // resolution path (`type_of_expr`, `member_name`, the shape
+                // table) pattern-matches on the receiver's SHAPE — so the
+                // receiver is resolved and emitted in its peeled form. `(x).f`
+                // then emits byte-identically to `x.f`; without this the paren
+                // stayed in the Go text AND hid the type, so `(mux).handle`
+                // emitted a lowercase Go method that does not exist.
+                let base = Self::peel_parens(base.as_ref());
                 let b = self.emit_expr(base, ATOM)?;
                 // Package-qualified members register the import.
-                if let Expr::Ident { name: root, .. } = base.as_ref() {
+                if let Expr::Ident { name: root, .. } = base {
                     if self.is_unshadowed_pkg_root(root) {
                         self.use_package(root);
                     }
@@ -514,6 +522,12 @@ impl Emitter {
     /// Returns None the moment a link is unknown — the caller falls back to
     /// the M4 heuristic. Never guesses.
     pub fn type_of_expr(&self, e: &Expr) -> Option<&'static str> {
+        // Parentheses are semantically transparent: `(x)` has x's type. This
+        // is a resolution entry point, so the peel has to happen here — a
+        // `Paren` that reaches the `match` below resolves to `None` and the
+        // caller then emits the member name unnormalized (`(hits).add(1)` for
+        // `hits.add(1)` on a `sync/atomic.Int64`), which `go build` rejects.
+        let e = Self::peel_parens(e);
         match e {
             Expr::Ident { name, .. } => {
                 if let Some(BindingKind::ForeignTy(t)) = self.bindings.get(name) {
@@ -536,8 +550,11 @@ impl Emitter {
                 }
                 // Batch I: user-struct field typing — `stats.mu` resolves
                 // through var_struct + struct_fields when the field's
-                // declared type is shape-known (18: sync.mutex).
-                if let Expr::Ident { name: vn, .. } = base.as_ref() {
+                // declared type is shape-known (18: sync.mutex). The root is
+                // peeled too: `(stats).mu` is the same field access as
+                // `stats.mu`, and a raw `Paren` here silently loses the
+                // struct type (then `mu.lock` emits lowercase and Go rejects).
+                if let Expr::Ident { name: vn, .. } = Self::peel_parens(base.as_ref()) {
                     if let Some(sn) = self.var_struct.get(vn) {
                         if let Some(fields) = self.struct_fields.get(sn) {
                             if let Some((_, fty)) = fields.iter().find(|(f, _)| f == name) {
@@ -587,9 +604,15 @@ impl Emitter {
             return self.emit_make(args);
         }
 
+        // A postfix receiver never needs parentheses, and every dispatch
+        // branch below keys on the receiver's SHAPE (package root, foreign
+        // binding, shape table), so each one peels first: `(mux).handle(...)`
+        // is `mux.handle(...)`, `(hits).add(1)` is `hits.add(1)`.
+
         // --- package-qualified calls ---
         if let Expr::Field { base, name, .. } = callee {
-            if let Expr::Ident { name: pkg, .. } = base.as_ref() {
+            let base = Self::peel_parens(base.as_ref());
+            if let Expr::Ident { name: pkg, .. } = base {
                 // Known to the checker, unshipped by the runtime (the
                 // audit's flate2 row): the honest refusal must come BEFORE
                 // the package-root gate — an unbound crate is not a Go
@@ -610,6 +633,7 @@ impl Emitter {
         // field-vs-method exactly (`r.url.query.get("a")` →
         // `r.URL.Query().Get("a")`); generic Foreign falls back to M4.
         if let Expr::Field { base, name, .. } = callee {
+            let base = Self::peel_parens(base.as_ref());
             if let Some(bt) = self.type_of_expr(base) {
                 if let Some(m) = lookup_member(bt, name) {
                     if m.kind == MemberKind::Method {
@@ -625,7 +649,7 @@ impl Emitter {
                     // — a clean failure, never a wrong emission.
                 }
             }
-            if let Expr::Ident { name: root, .. } = base.as_ref() {
+            if let Expr::Ident { name: root, .. } = base {
                 if let Some(BindingKind::Foreign) = self.bindings.get(root) {
                     let b = self.emit_expr(base, ATOM)?;
                     let mut parts = Vec::new();
@@ -639,8 +663,9 @@ impl Emitter {
 
         // --- slice `.pop()` → prelude helper (example 08's stack shape) ---
         if let Expr::Field { base, name, .. } = callee {
+            let base = Self::peel_parens(base.as_ref());
             if name == "pop" {
-                if let Expr::Ident { .. } = base.as_ref() {
+                if let Expr::Ident { .. } = base {
                     let b = self.emit_expr(base, ATOM)?;
                     return Ok(format!("hy_pop(&{})", b));
                 }
@@ -653,7 +678,8 @@ impl Emitter {
         // --- associated-fn calls: `lru_cache.new[string, int](2)` →
         //     `lru_cache_new[string, int](2)` (Go has no dotted idents) ---
         if let Expr::Field { base, name, .. } = callee {
-            if let Expr::Ident { name: root, .. } = base.as_ref() {
+            let base = Self::peel_parens(base.as_ref());
+            if let Expr::Ident { name: root, .. } = base {
                 if !self.is_unshadowed_pkg_root(root) && !self.bindings.contains_key(root) {
                     let (head, type_args) = split_type_args(name);
                     let full = format!("{}.{}", root, head);
