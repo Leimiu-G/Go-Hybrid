@@ -2302,16 +2302,23 @@ impl Emitter {
     // -----------------------------------------------------------------------
 
     /// Returns `Some(operand)` when `expr` is an O8 slot-loan `&m[k]` or `&s.field`.
+    ///
+    /// Parentheses are semantically transparent, so the O8 shape is recognised
+    /// through them: `(&m[k])` and `&(m[k])` are the same loan as `&m[k]`.
+    /// Missing this used to emit `x := (&m[k])` verbatim — Go rejects an
+    /// address-of on a map index, and the store-back was never scheduled, so
+    /// the `hyb check`-accepted program failed to build (GUARANTEES row 13).
     fn as_slot_loan_operand(expr: &Expr) -> Option<&Expr> {
-        match expr {
+        match Self::peel_parens(expr) {
             Expr::AddrOf { operand, .. }
             | Expr::Unary {
                 op: UnOp::Addr,
                 operand,
                 ..
-            } if matches!(operand.as_ref(), Expr::Index { .. } | Expr::Field { .. }) => {
-                Some(operand.as_ref())
-            }
+            } => match Self::peel_parens(operand) {
+                inner @ (Expr::Index { .. } | Expr::Field { .. }) => Some(inner),
+                _ => None,
+            },
             _ => None,
         }
     }

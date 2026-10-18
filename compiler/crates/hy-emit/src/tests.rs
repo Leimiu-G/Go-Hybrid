@@ -989,6 +989,59 @@ fn assign_slot_loan_copies_and_stores_back() {
 }
 
 #[test]
+fn slot_loan_lowers_through_redundant_parentheses() {
+    // Parentheses are semantically transparent, so `(&m[k])`, `&(m[k])` and
+    // `((&m[k]))` are the same O8 loan as `&m[k]`. Failing to see through
+    // them emitted the address-of verbatim — which `go build` rejects for a
+    // map index — and silently dropped the store-back, so a program the
+    // checker ACCEPTS failed to build (GUARANTEES row 13, BUILDABLE).
+    for src_binding in ["n := (&g.nodes[from])", "n := &(g.nodes[from])",
+                        "n := ((&g.nodes[from]))"] {
+        let go = emit(&format!(
+            "struct node {{\n    edges []int\n}}\n\nstruct graph {{\n    nodes map[int]node\n}}\n\nfn (g *graph) connect(from int, to int) {{\n    {}\n    n.edges = append(n.edges, to)\n}}\n",
+            src_binding
+        ));
+        assert!(
+            go.contains("n := g.nodes[from]"),
+            "`{}` must lower to the same copy read as `&g.nodes[from]`:\n{}",
+            src_binding,
+            go
+        );
+        assert!(
+            !go.contains("&g.nodes[from]"),
+            "`{}` must not leak the address-of into the emitted Go:\n{}",
+            src_binding,
+            go
+        );
+        assert!(
+            go.contains("g.nodes[from] = n"),
+            "`{}` must still schedule the store-back:\n{}",
+            src_binding,
+            go
+        );
+    }
+}
+
+#[test]
+fn assign_slot_loan_lowers_through_redundant_parentheses() {
+    // Issue #138's re-assignment form, same parenthesis blindness.
+    let go = emit(
+        "struct node {\n    edges []int\n}\n\nstruct graph {\n    nodes map[int]node\n}\n\nfn (g *graph) connect(from int, to int) {\n    var n node\n    n = (&g.nodes[from])\n    n.edges = append(n.edges, to)\n}\n",
+    );
+    assert!(go.contains("n = g.nodes[from]"), "copy assign (no &):\n{}", go);
+    assert!(
+        !go.contains("&g.nodes[from]"),
+        "must not leak the address-of:\n{}",
+        go
+    );
+    assert!(
+        go.contains("g.nodes[from] = n"),
+        "store-back at block end:\n{}",
+        go
+    );
+}
+
+#[test]
 fn single_var_iterate_value_semantics() {
     // Slices: `for w in shard` binds the VALUE (Go's range binds the index).
     let go = emit("fn f(shard []int) {\n    for w in shard {\n        _ = w\n    }\n}\n");
