@@ -92,6 +92,139 @@ class ConflictClassifier(unittest.TestCase):
         self.assertEqual(real, ["src/hycheck/buildable.rs"])
 
 
+class LabelReconcile(unittest.TestCase):
+    """`sync-labels` must be able to take a state label back off, not only put
+    one on. `rebase.exempt_labels` contains `bot:conflict`, so a label left
+    behind pins its PR out of W2 permanently: 8 of the 35 open PRs under
+    `bot:conflict` report mergeable=true / mergeable_state=behind on
+    2026-10-20, and the label predates the fix that cleared it (#986)."""
+
+    MAPPING = {"LAND-CANDIDATE": "bot:land-candidate",
+               "CONFLICTS": "bot:conflict",
+               "STALE-BASE": "bot:stale-base"}
+
+    def test_stale_conflict_is_removed_once_the_conflict_is_gone(self):
+        add, remove = sh.label_plan("STALE-BASE",
+                                    ["bot:conflict", "triage:new"],
+                                    self.MAPPING)
+        self.assertEqual(remove, ["bot:conflict"])
+        self.assertEqual(add, ["bot:stale-base"])
+
+    def test_current_state_costs_nothing(self):
+        add, remove = sh.label_plan("CONFLICTS", ["bot:conflict"],
+                                    self.MAPPING)
+        self.assertEqual((add, remove), ([], []))
+
+    def test_bucket_without_a_label_clears_every_state_label(self):
+        add, remove = sh.label_plan("RECON",
+                                    ["bot:land-candidate", "bot:stale-base"],
+                                    self.MAPPING)
+        self.assertEqual(add, [])
+        self.assertEqual(remove, ["bot:land-candidate", "bot:stale-base"])
+
+    def test_only_the_two_state_labels_coexist_never(self):
+        add, remove = sh.label_plan("CONFLICTS",
+                                    ["bot:stale-base", "bot:conflict"],
+                                    self.MAPPING)
+        self.assertEqual(add, [])
+        self.assertEqual(remove, ["bot:stale-base"])
+
+    def test_labels_owned_elsewhere_are_never_removed(self):
+        add, remove = sh.label_plan("RECON",
+                                    ["bot:ready-to-land", "bot:verified",
+                                     "bot:landed", "bot:preflight-pass",
+                                     "bot:stale-premise", "triage:keep"],
+                                    self.MAPPING)
+        self.assertEqual((add, remove), ([], []))
+
+    def test_absent_labels_key_is_survivable(self):
+        # items built by an older TRIAGE.json have no "labels" key at all;
+        # the scan must still add the bucket label rather than crash.
+        add, remove = sh.label_plan("STALE-BASE", None, self.MAPPING)
+        self.assertEqual(add, ["bot:stale-base"])
+        self.assertEqual(remove, [])
+
+
+class SyncLabelCalls(unittest.TestCase):
+    """Drive the real `sync-labels` command and inspect the HTTP verbs it
+    emits. With the pre-#986 code the stale `bot:conflict` survives every run
+    because the command only knows how to POST one on."""
+
+    def _run(self, items):
+        import argparse
+        import json as _json
+        import os
+        import tempfile
+
+        calls = []
+
+        class FakeGh:
+            repo = "o/r"
+            calls = 0
+            remaining = 999
+
+            def __init__(self, *a, **k):
+                pass
+
+            def post(self, path, body=None):
+                calls.append(("POST", path, body))
+                return 200, {}
+
+            def req(self, method, path, body=None):
+                calls.append((method, path, body))
+                return 200, None
+
+        fd, scan = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            _json.dump({"items": items}, fh)
+        args = argparse.Namespace(from_scan=scan, dry=False)
+        orig, had = sh.tb.Gh, os.environ.get("GITHUB_TOKEN")
+        os.environ["GITHUB_TOKEN"] = "unit-test-token"
+        sh.tb.Gh = FakeGh
+        try:
+            sh.cmd_sync_labels(args)
+        finally:
+            sh.tb.Gh = orig
+            if had is None:
+                os.environ.pop("GITHUB_TOKEN", None)
+            else:
+                os.environ["GITHUB_TOKEN"] = had
+            os.unlink(scan)
+        # keep only the per-PR label mutations, not ensure_palette's chatter
+        return [c for c in calls if "/issues/" in c[1]]
+
+    def test_stale_conflict_is_deleted_not_just_overposted(self):
+        # #711 on 2026-10-20: labelled bot:conflict at 05:44, force-pushed the
+        # fix at 06:27, still carrying the label afterwards.
+        out = self._run([{"number": 711, "bucket": "STALE-BASE",
+                          "labels": ["bot:conflict", "triage:new"],
+                          "wildcard_hold": False, "draft_parked": False}])
+        verbs = [(v, p.split("/")[-1]) for v, p, _ in out]
+        self.assertIn(("DELETE", "bot%3Aconflict"), verbs)
+        self.assertIn(("POST", "labels"), verbs)
+
+    def test_steady_state_costs_no_label_calls(self):
+        # the whole point of reconciling from the scan payload rather than
+        # fetching labels per PR: a PR already in sync must cost 0 calls.
+        out = self._run([{"number": 819, "bucket": "CONFLICTS",
+                          "labels": ["bot:conflict"],
+                          "wildcard_hold": False, "draft_parked": False}])
+        self.assertEqual(out, [])
+
+    def test_a_genuinely_conflicted_pr_is_still_labelled(self):
+        out = self._run([{"number": 931, "bucket": "CONFLICTS", "labels": [],
+                          "wildcard_hold": False, "draft_parked": False}])
+        verbs = [(v, p.split("/")[-1]) for v, p, _ in out]
+        self.assertEqual(verbs, [("POST", "labels")])
+        self.assertEqual(out[0][2], {"labels": ["bot:conflict"]})
+
+    def test_parked_prs_stay_untouched(self):
+        for key in ("wildcard_hold", "draft_parked"):
+            out = self._run([{"number": 5, "bucket": "CONFLICTS",
+                              "labels": ["bot:conflict"], key: True}])
+            self.assertEqual(out, [], key)
+
+
 class ProbeParser(unittest.TestCase):
     """W6 parses added diff lines only, and matches the #804 registry entry."""
 

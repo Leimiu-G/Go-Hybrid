@@ -206,6 +206,10 @@ def collect(cfg, gh, args):
             "age_days": age_days(pr["created_at"], now),
             "idle_days": age_days(pr["updated_at"], now),
             "draft": bool(pr.get("draft")),
+            # already in the paginated /pulls response -- recording
+            # it here costs no extra request, and sync-labels needs
+            # it to reconcile state labels (#986).
+            "labels": [lbl["name"] for lbl in pr.get("labels", [])],
             "mergeable": full.get("mergeable"),
             "mergeable_state": full.get("mergeable_state"),
             "head_sha": pr["head"]["sha"][:12],

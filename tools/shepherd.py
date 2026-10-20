@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+from urllib.parse import quote
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -146,7 +147,8 @@ def cmd_labels(args):
 
 def cmd_sync_labels(args):
     """Structural bot:* labels, straight from classify()'s buckets (plan §2:
-    state lives in labels; the board is a view). Idempotent POST per PR."""
+    state lives in labels; the board is a view). Reconciled both ways:
+    a label whose bucket no longer applies is removed (#986)."""
     cfg = load_cfg()
     gh = tb.Gh(cfg["repo"], tb.load_token(args))
     ensure_palette(gh, cfg)
@@ -157,21 +159,54 @@ def cmd_sync_labels(args):
     n = 0
     for it in items:
         want = mapping.get(it["bucket"])
-        if not want or it.get("wildcard_hold") or it.get("draft_parked"):
+        if it.get("wildcard_hold") or it.get("draft_parked"):
+            continue
+        add, remove = label_plan(it["bucket"], it.get("labels"), mapping)
+        if not add and not remove:
             continue
         n += 1
         if args.dry:
-            tb.log("  #%d -> %s" % (it["number"], want))
+            tb.log("  #%d -> +%s -%s" % (it["number"], add, remove))
             continue
         try:
-            gh.post("/repos/%s/issues/%d/labels" % (gh.repo, it["number"]),
-                    {"labels": [want]})
+            # Take the superseded state labels off first: a PR that keeps a
+            # stale bot:conflict stays exempt from W2 forever (#986).
+            for lbl in remove:
+                gh.req("DELETE", "/repos/%s/issues/%d/labels/%s"
+                       % (gh.repo, it["number"], quote(lbl, safe="")))
+            if add:
+                gh.post("/repos/%s/issues/%d/labels" % (gh.repo, it["number"]),
+                        {"labels": add})
         except (RuntimeError, tb.RateGuard) as e:
             tb.log("  FAIL #%d: %s" % (it["number"], e))
             if isinstance(e, tb.RateGuard):
                 break
     tb.log("sync-labels: %d candidates, %d calls, %s remaining"
            % (n, gh.calls, gh.remaining))
+
+
+def label_plan(bucket, current_labels, mapping):
+    """Reconcile the structural bot:* state labels against `bucket`.
+
+    `sync-labels` used to POST the current bucket's label and never take the
+    previous bucket's label off, which made the three state labels a one-way
+    ratchet. That is not cosmetic: `rebase.exempt_labels` contains
+    `bot:conflict`, so a PR that ever conflicted was skipped by W2 for good,
+    even after its author force-pushed the conflict away -- the label caused
+    the staleness it claimed to report (#986).
+
+    Returns (add, remove). Both may be empty, in which case the caller makes
+    no API call at all, so a steady-state run costs what it costs today.
+    Only the labels in `mapping` are ever removed: bot:ready-to-land,
+    bot:preflight-*, bot:verified, bot:landed and bot:stale-premise are
+    owned elsewhere and are left alone.
+    """
+    managed = set(mapping.values())
+    want = mapping.get(bucket)
+    have = set(current_labels or ())
+    add = [want] if want and want not in have else []
+    remove = sorted(lbl for lbl in have if lbl in managed and lbl != want)
+    return add, remove
 
 
 # ------------------------------------------------------------------ W2 rebase
